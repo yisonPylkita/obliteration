@@ -1,5 +1,7 @@
+use bitflags::bitflags;
 use byteorder::{ByteOrder, LE};
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::ops::Index;
 use std::slice::SliceIndex;
 use thiserror::Error;
@@ -12,6 +14,7 @@ pub struct DynamicLinking {
     relaent: usize,
     pltrel: u64,
     fingerprint: u64,
+    flags: Option<ModuleFlags>,
     filename: u64,
     module_info: ModuleInfo,
     dependencies: HashMap<u16, ModuleInfo>,
@@ -135,6 +138,7 @@ impl DynamicLinking {
         let mut syment: Option<u64> = None;
         let mut pltrel: Option<u64> = None;
         let mut fingerprint: Option<u64> = None;
+        let mut flags: Option<ModuleFlags> = None;
         let mut filename: Option<u64> = None;
         let mut module_info: Option<ModuleInfo> = None;
         let mut dependencies: HashMap<u16, ModuleInfo> = HashMap::new();
@@ -174,7 +178,7 @@ impl DynamicLinking {
                 Self::DT_FINI_ARRAY => {}
                 Self::DT_INIT_ARRAYSZ => {}
                 Self::DT_FINI_ARRAYSZ => {}
-                Self::DT_FLAGS => {}
+                Self::DT_FLAGS => flags = Some(ModuleFlags::from_bits_retain(LE::read_u64(value))),
                 Self::DT_PREINIT_ARRAY => {}
                 Self::DT_PREINIT_ARRAYSZ => {}
                 Self::DT_SCE_FINGERPRINT => fingerprint = Some(LE::read_u64(value)),
@@ -315,6 +319,16 @@ impl DynamicLinking {
             relaent: relaent.ok_or(ParseError::NoRelaent)? as usize,
             pltrel: pltrel.ok_or(ParseError::NoPltrel)?,
             fingerprint: fingerprint.ok_or(ParseError::NoFingerprint)?,
+            flags: match flags {
+                Some(v) => {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                }
+                None => return Err(ParseError::NoFlags),
+            },
             filename: filename.ok_or(ParseError::NoFilename)?,
             module_info: module_info.ok_or(ParseError::NoModuleInfo)?,
             dependencies,
@@ -337,12 +351,20 @@ impl DynamicLinking {
         Ok(parsed)
     }
 
+    pub fn flags(&self) -> Option<ModuleFlags> {
+        self.flags
+    }
+
     pub fn module_info(&self) -> &ModuleInfo {
         &self.module_info
     }
 
     pub fn dependencies(&self) -> &HashMap<u16, ModuleInfo> {
         &self.dependencies
+    }
+
+    pub fn libraries(&self) -> &HashMap<u16, LibraryInfo> {
+        &self.libraries
     }
 
     pub fn symbols(&self) -> &[SymbolInfo] {
@@ -380,13 +402,17 @@ impl DynamicLinking {
 
             // Parse symbol name.
             let sym = &self.symbols[index];
-            let (sym_name, lib_id, mod_id) = match Self::parse_symbol_name(&sym.name) {
+            let (sym_name, lib_id, mod_id) = match sym.decode_name() {
                 Some(v) => v,
-                None => panic!("Invalid symbol name: {}", sym.name), // FIXME: Do not panic.
+                None => {
+                    index = chains[index] as usize;
+                    continue;
+                }
             };
 
             if mod_id != 0 {
-                panic!("Unexpected module ID: {mod_id}");
+                index = chains[index] as usize;
+                continue;
             }
 
             // Get target library.
@@ -409,53 +435,21 @@ impl DynamicLinking {
 
         None
     }
+}
 
-    fn parse_symbol_name(name: &str) -> Option<(&str, u16, u16)> {
-        // Extract local name.
-        let (name, remain) = match name.find('#') {
-            Some(v) => (&name[..v], &name[(v + 1)..]),
-            None => return None,
-        };
-
-        if name.is_empty() {
-            return None;
-        }
-
-        // Extract library ID and module ID.
-        let (lib_id, mod_id) = match remain.find('#') {
-            Some(v) => (&remain[..v], &remain[(v + 1)..]),
-            None => return None,
-        };
-
-        if lib_id.is_empty() || mod_id.is_empty() {
-            return None;
-        }
-
-        // Decode module ID and library ID.
-        let mod_id = Self::decode_id(mod_id)?;
-        let lib_id = Self::decode_id(lib_id)?;
-
-        Some((name, lib_id, mod_id))
+bitflags! {
+    /// Contains flags for a module.
+    #[derive(Clone, Copy)]
+    pub struct ModuleFlags: u64 {
+        const DF_SYMBOLIC = 0x02;
+        const DF_TEXTREL = 0x04;
+        const DF_BIND_NOW = 0x08;
     }
+}
 
-    fn decode_id(v: &str) -> Option<u16> {
-        if v.len() > 3 {
-            return None;
-        }
-
-        let s = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
-        let mut r = 0u32;
-
-        for c in v.chars() {
-            r <<= 6;
-            r |= s.find(c)? as u32;
-        }
-
-        if r > u16::MAX as _ {
-            None
-        } else {
-            Some(r as u16)
-        }
+impl Display for ModuleFlags {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -540,6 +534,54 @@ impl SymbolInfo {
 
     pub fn value(&self) -> usize {
         self.value
+    }
+
+    pub fn decode_name(&self) -> Option<(&str, u16, u16)> {
+        // Extract local name.
+        let (name, remain) = match self.name.find('#') {
+            Some(v) => (&self.name[..v], &self.name[(v + 1)..]),
+            None => return None,
+        };
+
+        if name.is_empty() {
+            return None;
+        }
+
+        // Extract library ID and module ID.
+        let (lib_id, mod_id) = match remain.find('#') {
+            Some(v) => (&remain[..v], &remain[(v + 1)..]),
+            None => return None,
+        };
+
+        if lib_id.is_empty() || mod_id.is_empty() {
+            return None;
+        }
+
+        // Decode module ID and library ID.
+        let mod_id = Self::decode_id(mod_id)?;
+        let lib_id = Self::decode_id(lib_id)?;
+
+        Some((name, lib_id, mod_id))
+    }
+
+    fn decode_id(v: &str) -> Option<u16> {
+        if v.len() > 3 {
+            return None;
+        }
+
+        let s = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
+        let mut r = 0u32;
+
+        for c in v.chars() {
+            r <<= 6;
+            r |= s.find(c)? as u32;
+        }
+
+        if r > u16::MAX as _ {
+            None
+        } else {
+            Some(r as u16)
+        }
     }
 }
 
@@ -672,6 +714,9 @@ pub enum ParseError {
 
     #[error("entry DT_SCE_FINGERPRINT does not exists")]
     NoFingerprint,
+
+    #[error("entry DT_FLAGS does not exists")]
+    NoFlags,
 
     #[error("entry DT_SCE_FILENAME does not exists")]
     NoFilename,
